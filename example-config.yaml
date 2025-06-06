@@ -1,0 +1,10 @@
+graylog_addr: "192.168.1.20:12201"
+http_ports:
+  - 80
+  - 8080
+udp_ports:
+  - 53
+  - 123
+tcp_ports:
+  - 21
+  - 23

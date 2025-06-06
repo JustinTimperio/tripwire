@@ -1,0 +1,4 @@
+.history
+honeypot/config.yaml
+honeypot/tripwire
+server/.env
