@@ -1,40 +1,35 @@
 package main
 
 import (
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"log"
 	"net"
-	"os"
 	"sync"
 	"time"
 )
 
-var maxRecivedBuffers = 10_000
-
 type PortServer struct {
-	Pls   []PortListener
+	Pls      []PortListener
+	TLSCert  tls.Certificate
+	CertPool *x509.CertPool
+
 	Stats chan ConnectionStats
 }
 
 type PortListener struct {
 	Proto string
-	Ports []int
+	Port  int
+	TLS   bool
 }
 
-type ConnectionStats struct {
-	RemoteAddr string        `json:"remote_addr"`
-	LocalAddr  string        `json:"local_addr"`
-	StartTime  time.Time     `json:"start_time"`
-	EndTime    time.Time     `json:"end_time"`
-	Duration   time.Duration `json:"duration"`
-	DataVolume int           `json:"data_volume"`
-	Hostname   string        `json:"hostname"`
-}
-
-func NewPortServer(portListeners []PortListener) *PortServer {
+func NewPortServer(portListeners []PortListener, cert tls.Certificate, certPool *x509.CertPool) *PortServer {
 	return &PortServer{
-		Pls:   portListeners,
-		Stats: make(chan ConnectionStats),
+		Pls:      portListeners,
+		Stats:    make(chan ConnectionStats),
+		TLSCert:  cert,
+		CertPool: certPool,
 	}
 }
 
@@ -43,125 +38,183 @@ func (t *PortServer) Start() {
 
 	for _, listener := range t.Pls {
 
-		for _, port := range listener.Ports {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
 
-			wg.Add(1)
-			go func(port int, proto string) {
-				defer wg.Done()
+			var (
+				err  error
+				conn net.Listener
+			)
 
-				switch proto {
-				case "tcp":
-					conn, err := net.Listen(proto, fmt.Sprintf(":%d", port))
+			switch listener.Proto {
+			case "tcp":
+				log.Printf("Listening on for %s traffic with the TLS flag %v on port: %v\n", listener.Proto, listener.TLS, listener.Port)
+
+				if listener.TLS {
+					var supported []uint16
+					for _, cs := range tls.CipherSuites() {
+						supported = append(supported, cs.ID)
+					}
+
+					// Create a TLS configuration
+					config := &tls.Config{
+						Certificates: []tls.Certificate{t.TLSCert},
+						ClientAuth:   tls.NoClientCert, // Optional - for mutual TLS, use tls.RequireAndVerifyClientCert
+						RootCAs:      t.CertPool,
+						CipherSuites: supported,
+					}
+					conn, err = tls.Listen(listener.Proto, fmt.Sprintf(":%d", listener.Port), config)
 					if err != nil {
-						log.Printf("Error listening on TCP port %d: %v", port, err)
+						log.Printf("Error listening on TCP port %d: %v", listener.Port, err)
 						return
 					}
 
-					log.Printf("Listening on for %s traffic on port: %v\n", proto, port)
-					for {
-						stats, err := t.handleTCPConnection(conn)
-						if err != nil {
-							log.Println("Error Accepting Connection! error:", err)
-						}
-						t.Stats <- *stats
-					}
-
-				case "udp":
-					pconn, err := net.ListenPacket("udp", fmt.Sprintf(":%d", port))
+				} else {
+					conn, err = net.Listen(listener.Proto, fmt.Sprintf(":%d", listener.Port))
 					if err != nil {
-						log.Printf("Error listening on UDP port %d: %v", port, err)
+						log.Printf("Error listening on TCP port %d: %v", listener.Port, err)
 						return
 					}
-					defer pconn.Close()
-
-					log.Printf("Listening on for %s traffic on port: %v\n", proto, port)
-					t.handleUDPConnection(pconn)
-
-				default:
-					log.Printf("Unsupported protocol: %s on port %d", proto, port)
-					return
 				}
 
-			}(port, listener.Proto)
-		}
+				for {
+					err = t.handleTCPConnection(conn)
+					if err != nil {
+						log.Println("Error Accepting Connection! error:", err)
+					}
+				}
+
+			case "udp":
+				conn, err := net.ListenPacket("udp", fmt.Sprintf(":%d", listener.Port))
+				if err != nil {
+					log.Printf("Error listening on UDP port %d: %v", listener.Port, err)
+					return
+				}
+				defer conn.Close()
+				log.Printf("Listening on for %s traffic on port: %v\n", listener.Proto, listener.Port)
+
+				for {
+					t.handleUDPConnection(conn)
+				}
+
+			default:
+				log.Printf("Unsupported protocol: %s on port %d", listener.Proto, listener.Port)
+				return
+			}
+		}()
 	}
 
 	wg.Wait()
 	log.Println("Port Server Stopped")
 }
 
-func (t *PortServer) handleTCPConnection(con net.Listener) (*ConnectionStats, error) {
+func (t *PortServer) handleTCPConnection(con net.Listener) error {
 	conn, err := con.Accept()
 	if err != nil {
-		return &ConnectionStats{}, err
+		return err
 	}
 	defer conn.Close()
 
-	remoteAddr := conn.RemoteAddr().String()
-	localAddr := conn.LocalAddr().String()
-
-	log.Printf("New connection from %s to %s\n", remoteAddr, localAddr)
-
-	// Capture basic stats.  More comprehensive stats could be captured
 	stats := ConnectionStats{
-		RemoteAddr: remoteAddr,
-		LocalAddr:  localAddr,
-		StartTime:  time.Now(),
+		StartTime: time.Now(),
 	}
 
-	go func() {
-		buffer := make([]byte, 4096)
-		for range maxRecivedBuffers {
-			n, err := conn.Read(buffer)
-			if err != nil {
-				stats.EndTime = time.Now()
-				stats.Duration = stats.EndTime.Sub(stats.StartTime)
-				log.Printf("Connection closed after %s from %s to %s\n", stats.Duration, remoteAddr, localAddr)
-				return
+	host, port, err := net.SplitHostPort(conn.RemoteAddr().String())
+	if err == nil {
+		stats.RemoteAddr = host
+		stats.RemotePort = port
+	} else {
+		stats.RemoteAddr = conn.RemoteAddr().String()
+		stats.RemotePort = "unknown"
+	}
+
+	host, port, err = net.SplitHostPort(conn.LocalAddr().String())
+	if err == nil {
+		stats.LocalAddr = host
+		stats.LocalPort = port
+	} else {
+		stats.LocalAddr = conn.LocalAddr().String()
+		stats.LocalPort = "unknown"
+	}
+
+	tlsConn, ok := conn.(*tls.Conn)
+	if ok {
+		tlsConn.Handshake()
+		stats.TLS = tlsConn.ConnectionState()
+
+		go func() {
+			buffer := make([]byte, 1024)
+
+			for {
+				n, err := tlsConn.Read(buffer)
+				if err != nil {
+					stats.EndTime = time.Now()
+					stats.Duration = stats.EndTime.Sub(stats.StartTime)
+					t.Stats <- stats
+					return
+				}
+
+				stats.DataVolume += n
 			}
+		}()
 
-			log.Printf("Received data from %s to %s", remoteAddr, localAddr)
+	} else {
 
-			// Update statistics
-			stats.DataVolume += len(buffer[:n])
-		}
+		go func() {
+			buffer := make([]byte, 1024)
 
-		go conn.Close()
-		stats.EndTime = time.Now()
-		stats.Duration = stats.EndTime.Sub(stats.StartTime)
-		log.Printf("Closed after %s from %s to %s\n", stats.Duration, remoteAddr, localAddr)
-	}()
+			for {
+				n, err := conn.Read(buffer)
+				if err != nil {
+					stats.EndTime = time.Now()
+					stats.Duration = stats.EndTime.Sub(stats.StartTime)
+					t.Stats <- stats
+					return
+				}
 
-	return &stats, nil
+				stats.DataVolume += len(buffer[:n])
+			}
+		}()
+	}
+
+	return nil
 }
 
-func (t *PortServer) handleUDPConnection(pconn net.PacketConn) {
-	hn, _ := os.Hostname()
-	buffer := make([]byte, 4096)
-	for {
-		s := time.Now()
-		n, addr, err := pconn.ReadFrom(buffer)
-		if err != nil {
-			log.Printf("Error reading from UDP connection: %v", err)
-			return
-		}
-		e := time.Now()
-
-		remoteAddr := addr.String()
-		log.Printf("Received %d bytes from UDP %s", n, remoteAddr)
-
-		// Capture basic stats. More comprehensive stats could be captured
-		stats := ConnectionStats{
-			RemoteAddr: remoteAddr,
-			LocalAddr:  pconn.LocalAddr().String(),
-			StartTime:  s,
-			EndTime:    e,
-			Duration:   e.Sub(s),
-			DataVolume: len(buffer[:n]),
-			Hostname:   hn,
-		}
-		t.Stats <- stats
-
-		log.Printf("UDP received from %s, duration %s", remoteAddr, stats.Duration)
+func (t *PortServer) handleUDPConnection(conn net.PacketConn) {
+	buffer := make([]byte, 1024)
+	s := time.Now()
+	n, addr, err := conn.ReadFrom(buffer)
+	if err != nil {
+		log.Printf("Error reading from UDP connection: %v", err)
+		return
 	}
+	e := time.Now()
+
+	// Capture basic stats. More comprehensive stats could be captured
+	stats := ConnectionStats{
+		StartTime:  s,
+		EndTime:    e,
+		Duration:   e.Sub(s),
+		DataVolume: len(buffer[:n]),
+	}
+
+	host, port, err := net.SplitHostPort(addr.String())
+	if err == nil {
+		stats.RemoteAddr = host
+		stats.RemotePort = port
+	} else {
+		stats.RemoteAddr = addr.String()
+		stats.RemotePort = "unknown"
+	}
+
+	host, port, err = net.SplitHostPort(conn.LocalAddr().String())
+	if err == nil {
+		stats.LocalAddr = host
+		stats.LocalPort = port
+	} else {
+		stats.LocalAddr = conn.LocalAddr().String()
+		stats.LocalPort = "unknown"
+	}
+	t.Stats <- stats
 }

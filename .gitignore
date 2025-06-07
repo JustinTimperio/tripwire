@@ -1,4 +1,6 @@
 .history
 honeypot/config.yaml
 honeypot/tripwire
+honeypot/server.crt
+honeypot/server.key
 server/.env
